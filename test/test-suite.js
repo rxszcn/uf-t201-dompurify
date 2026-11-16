@@ -1257,6 +1257,375 @@
     );
 
     // =======================================================================
+    // Write gating: the post-walk rescrub (_scrubOwnCharacterData) must not
+    // write character data back when the value is unchanged. The per-text-node
+    // scrub inside _sanitizeElements already gates its textContent write on a
+    // change; the rescrub paths (RETURN_DOM, RETURN_DOM_FRAGMENT, IN_PLACE and
+    // the serialized-marker string path) used to assign .data unconditionally,
+    // so a clean 2000-text-node document took 2000 no-op writes and fired 2000
+    // characterData mutations.
+    // =======================================================================
+
+    // Installs a counting wrapper around the CharacterData `data` setter on
+    // the prototype that actually defines it (Text/Comment/... share it).
+    // Returns a reset/read/restore handle, or null when the engine exposes no
+    // interceptable `data` accessor (purify-edge stores it as an own data
+    // property), in which case setter counting cannot be installed.
+    // Besides the raw write count it tracks no-op writes, where the assigned
+    // value equals the current one: those are the writes the gating must
+    // eliminate in every engine, since they still queue a characterData
+    // mutation. Engines differ in *where* a dirty node is rewritten (the
+    // walk-time textContent scrub versus the rescrub), so the rescrub write
+    // count itself is not engine-portable; "zero same-value writes" is the
+    // invariant that actually matters.
+    const installDataWriteProbe = () => {
+      const CharacterDataProto = window.CharacterData
+        ? window.CharacterData.prototype
+        : Object.getPrototypeOf(window.document.createTextNode(''));
+      let holderProto = CharacterDataProto;
+      while (
+        holderProto &&
+        !Object.getOwnPropertyDescriptor(holderProto, 'data')
+      ) {
+        holderProto = Object.getPrototypeOf(holderProto);
+      }
+
+      if (!holderProto) {
+        return null;
+      }
+
+      const descriptor = Object.getOwnPropertyDescriptor(holderProto, 'data');
+      if (!descriptor || typeof descriptor.set !== 'function') {
+        return null;
+      }
+      let writes = 0;
+      let sameValueWrites = 0;
+      Object.defineProperty(holderProto, 'data', {
+        configurable: true,
+        enumerable: descriptor.enumerable,
+        get: descriptor.get,
+        set(value) {
+          writes++;
+          if (descriptor.get.call(this) === value) {
+            sameValueWrites++;
+          }
+
+          descriptor.set.call(this, value);
+        },
+      });
+
+      return {
+        reset() {
+          writes = 0;
+          sameValueWrites = 0;
+        },
+        count() {
+          return writes;
+        },
+        sameValueCount() {
+          return sameValueWrites;
+        },
+        restore() {
+          Object.defineProperty(holderProto, 'data', descriptor);
+        },
+      };
+    };
+
+    // IN_PLACE needs the engine to expose an element's tag name through the
+    // cached Node.prototype nodeName getter and accept an allow-listed live
+    // root. happy-dom does not satisfy this, so its own IN_PLACE regression
+    // tests fail there as well; detect it once and skip the IN_PLACE arms
+    // rather than report engine limitations as gating regressions.
+    const inPlaceIsSupported = () => {
+      try {
+        const probe = document.createElement('div');
+        DOMPurify.sanitize(probe, { IN_PLACE: true, SAFE_FOR_TEMPLATES: true });
+        return true;
+      } catch (_) {
+        return false;
+      }
+    };
+
+    QUnit.test(
+      'rescrub performs zero character-data writes for clean documents',
+      (assert) => {
+        const probe = installDataWriteProbe();
+        if (!probe) {
+          assert.ok(
+            true,
+            'engine exposes no interceptable CharacterData.data setter; skipping'
+          );
+          return;
+        }
+
+        const supportsInPlace = inPlaceIsSupported();
+        const textNodeCount = 2000;
+        const cleanMarkup =
+          '<div>' +
+          Array.from(
+            { length: textNodeCount },
+            (_, index) => `<p>clean text ${index}</p>`
+          ).join('') +
+          '</div>';
+        const buildCleanElement = () => {
+          const element = document.createElement('div');
+          element.innerHTML = cleanMarkup;
+          return element;
+        };
+
+        try {
+          probe.reset();
+          DOMPurify.sanitize(cleanMarkup, { SAFE_FOR_TEMPLATES: true });
+          assert.equal(
+            probe.count(),
+            0,
+            'string path: clean document takes no .data writes'
+          );
+
+          probe.reset();
+          DOMPurify.sanitize(cleanMarkup, {
+            SAFE_FOR_TEMPLATES: true,
+            RETURN_DOM: true,
+          });
+          assert.equal(
+            probe.count(),
+            0,
+            'RETURN_DOM: 2000 clean text nodes take no .data writes'
+          );
+
+          probe.reset();
+          DOMPurify.sanitize(cleanMarkup, {
+            SAFE_FOR_TEMPLATES: true,
+            RETURN_DOM_FRAGMENT: true,
+          });
+          assert.equal(
+            probe.count(),
+            0,
+            'RETURN_DOM_FRAGMENT: 2000 clean text nodes take no .data writes'
+          );
+
+          probe.reset();
+          if (supportsInPlace) {
+            DOMPurify.sanitize(buildCleanElement(), {
+              SAFE_FOR_TEMPLATES: true,
+              IN_PLACE: true,
+            });
+            assert.equal(
+              probe.count(),
+              0,
+              'IN_PLACE: 2000 clean text nodes take no .data writes'
+            );
+          } else {
+            assert.ok(true, 'IN_PLACE unsupported in this engine; skipping');
+          }
+
+          // Dirty nodes still get written. The gating invariant is that no
+          // write carries the same value it replaces: every remaining write
+          // is a real scrub, never a no-op that would queue a mutation. How
+          // many writes that is depends on the engine's walker — jsdom
+          // rewrites dirty text during the walk and leaves the rescrub at
+          // zero, happy-dom's iterator reports text nodes only during the
+          // rescrub — but the same-value count must be zero either way.
+          const dirtyMarkup =
+            cleanMarkup +
+            '<div><p>{{mustache}}</p><p><% erb %></p>' +
+            '<p>${template}</p><p>{{unbalanced</p></div>';
+          probe.reset();
+          const dirtyDom = DOMPurify.sanitize(dirtyMarkup, {
+            SAFE_FOR_TEMPLATES: true,
+            RETURN_DOM: true,
+          });
+          assert.equal(
+            probe.sameValueCount(),
+            0,
+            'RETURN_DOM: dirty document takes no same-value .data write'
+          );
+          assert.notOk(
+            /\{\{|\$\{/.test(dirtyDom.innerHTML),
+            'RETURN_DOM: the template markers themselves are still scrubbed'
+          );
+
+          if (supportsInPlace) {
+            const dirtyElement = document.createElement('div');
+            dirtyElement.innerHTML = dirtyMarkup;
+            probe.reset();
+            DOMPurify.sanitize(dirtyElement, {
+              SAFE_FOR_TEMPLATES: true,
+              IN_PLACE: true,
+            });
+            assert.equal(
+              probe.sameValueCount(),
+              0,
+              'IN_PLACE: dirty document takes no same-value .data write'
+            );
+            assert.notOk(
+              /\{\{|<%|\$\{/.test(dirtyElement.innerHTML),
+              'IN_PLACE: the template markers themselves are still scrubbed'
+            );
+          } else {
+            assert.ok(true, 'IN_PLACE unsupported in this engine; skipping');
+          }
+        } finally {
+          probe.restore();
+        }
+      }
+    );
+
+    QUnit.test(
+      'gated rescrub output is byte-identical across every return path',
+      (assert) => {
+        const fixtures = [
+          // Fully clean: the gating must leave the tree untouched
+          '<div><p>plain text</p><p>more plain text</p></div>',
+          '<ul><li>one</li><li>two</li><li>three</li></ul>',
+          '<a href="https://example.com/">link</a><img src="x.png" alt="x">',
+          // Markers of all three dialects, including several per node
+          '<a>123{{456}}<b><style><% alert(1) %></style>456</b></a>',
+          '<a>{{123}}abc{{456}}<b><% 123 %>def<% 456 %></b></a>',
+          '<p>${templateLiteral} and ${another}</p>',
+          // Unbalanced / greedy cases and mixed clean + dirty nodes
+          '<b>123{{45{{6}}</b><p>clean sibling</p>',
+          '<p>Hello <b>world</b> {single} brace</p>',
+          // Entities, nested structure and an attribute-level marker
+          '<form action="https://example.com/?a=1&amp;b=2">' +
+            '<input name="q" value="{{v}}"></form>',
+          // Boundary-spanning expression reconstituted after element removal
+          '<div>{<foo></foo>{constructor.constructor("alert(1)")()}' +
+            '<foo></foo>}</div>',
+          '<p>&lt;<x></x>% name %<x></x>&gt;</p>',
+        ];
+        const cfg = { SAFE_FOR_TEMPLATES: true };
+        const supportsInPlace = inPlaceIsSupported();
+
+        fixtures.forEach((fixture, index) => {
+          const stringOutput = DOMPurify.sanitize(fixture, cfg);
+
+          const domResult = DOMPurify.sanitize(fixture, {
+            ...cfg,
+            RETURN_DOM: true,
+          });
+          const fragmentResult = DOMPurify.sanitize(fixture, {
+            ...cfg,
+            RETURN_DOM_FRAGMENT: true,
+          });
+
+          const fragmentHost = document.createElement('div');
+          fragmentHost.appendChild(fragmentResult);
+
+          assert.equal(
+            domResult.innerHTML,
+            stringOutput,
+            `fixture ${index}: RETURN_DOM serialization matches string output`
+          );
+          assert.equal(
+            fragmentHost.innerHTML,
+            stringOutput,
+            `fixture ${index}: RETURN_DOM_FRAGMENT serialization matches`
+          );
+
+          if (supportsInPlace) {
+            const inPlaceElement = document.createElement('div');
+            inPlaceElement.innerHTML = fixture;
+            DOMPurify.sanitize(inPlaceElement, { ...cfg, IN_PLACE: true });
+            assert.equal(
+              inPlaceElement.innerHTML,
+              stringOutput,
+              `fixture ${index}: IN_PLACE serialization matches string output`
+            );
+          }
+        });
+
+        if (!supportsInPlace) {
+          assert.ok(true, 'IN_PLACE unsupported in this engine; skipping');
+          return;
+        }
+
+        // The clean fixture must also keep its exact text node values,
+        // proving the skipped write changes nothing observable.
+        const element = document.createElement('div');
+        element.innerHTML =
+          '<p>first clean node</p><p>second clean node</p><p>third</p>';
+        const before = Array.from(
+          element.querySelectorAll('p'),
+          (paragraph) => paragraph.firstChild.data
+        );
+        DOMPurify.sanitize(element, { ...cfg, IN_PLACE: true });
+        const after = Array.from(
+          element.querySelectorAll('p'),
+          (paragraph) => paragraph.firstChild.data
+        );
+        assert.deepEqual(
+          after,
+          before,
+          'clean character data is preserved verbatim under IN_PLACE'
+        );
+      }
+    );
+
+    QUnit.test(
+      'gated rescrub fires no characterData mutation for clean in-place trees',
+      (assert) => {
+        if (!inPlaceIsSupported()) {
+          assert.ok(true, 'IN_PLACE unsupported in this engine; skipping');
+          return;
+        }
+
+        if (typeof window.MutationObserver !== 'function') {
+          assert.ok(
+            true,
+            'engine has no MutationObserver constructor; skipping'
+          );
+          return;
+        }
+
+        // jsdom's normalize() implementation queues a characterData record
+        // even when no adjacent text nodes are merged; browsers do not. The
+        // setter-count probe above is engine-independent, so this observer
+        // check runs only where normalize() follows the browser contract.
+        const element = document.createElement('div');
+        element.innerHTML = Array.from(
+          { length: 30 },
+          (_, index) => `<p>clean node ${index}</p>`
+        ).join('');
+
+        const probeElement = document.createElement('div');
+        probeElement.innerHTML = '<p>normalize probe</p>';
+        const observer = new window.MutationObserver(() => {});
+        observer.observe(probeElement, {
+          characterData: true,
+          subtree: true,
+        });
+        probeElement.normalize();
+        const normalizeIsQuiet = observer.takeRecords().length === 0;
+        observer.disconnect();
+
+        if (!normalizeIsQuiet) {
+          assert.expect(0);
+          return;
+        }
+
+        const cleanObserver = new window.MutationObserver(() => {});
+        cleanObserver.observe(element, {
+          characterData: true,
+          subtree: true,
+        });
+        DOMPurify.sanitize(element, {
+          SAFE_FOR_TEMPLATES: true,
+          IN_PLACE: true,
+        });
+        const records = cleanObserver
+          .takeRecords()
+          .filter((record) => record.type === 'characterData');
+        cleanObserver.disconnect();
+        assert.equal(
+          records.length,
+          0,
+          'no characterData mutation fires while rescrubbing a clean tree'
+        );
+      }
+    );
+
+    // =======================================================================
     // Config: SANITIZE_DOM
     // =======================================================================
 

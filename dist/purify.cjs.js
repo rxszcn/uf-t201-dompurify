@@ -1863,6 +1863,13 @@ function createDOMPurify() {
 	* data. Template contents and shadow roots are not entered, their own
 	* _sanitizeShadowDOM call scrubs them.
 	*
+	* The write-back is gated on an actual value change, matching the
+	* per-text-node scrub in _sanitizeElements: a clean node's character data
+	* is left untouched, so neither a redundant CharacterData write nor a
+	* characterData mutation fires for documents that contain no template
+	* expression. normalize() above may still merge adjacent text nodes, but
+	* on an already-normalized tree it is a no-op as well.
+	*
 	* @param node The root whose own character data should be scrubbed.
 	*/
 	const _scrubOwnCharacterData = function _scrubOwnCharacterData(node) {
@@ -1870,7 +1877,9 @@ function createDOMPurify() {
 		const walker = _createNodeIterator(node, true);
 		let currentNode = walker.nextNode();
 		while (currentNode) {
-			currentNode.data = _stripTemplateExpressions(currentNode.data);
+			const data = currentNode.data;
+			const scrubbedData = _stripTemplateExpressions(data);
+			if (scrubbedData !== data) currentNode.data = scrubbedData;
 			currentNode = walker.nextNode();
 		}
 	};
